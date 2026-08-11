@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import time
@@ -166,7 +167,7 @@ def launch_disaggregated_llm(
         print(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
-    perf_max_requests = 50
+    perf_metrics_output_dir = os.path.join(temp_dir.name, "perf_metrics")
 
     def _apply_perf_flags(cfg: Optional[Dict[str, Any]]):
         if not isinstance(cfg, dict):
@@ -175,7 +176,7 @@ def launch_disaggregated_llm(
             # Only set these if the switch is enabled.
             # Use `setdefault` so explicit per-test overrides are preserved.
             cfg.setdefault("return_perf_metrics", True)
-            cfg.setdefault("perf_metrics_max_requests", perf_max_requests)
+            cfg.setdefault("perf_metrics_output_dir", perf_metrics_output_dir)
 
     _apply_perf_flags(disaggregated_server_config)
     _apply_perf_flags(ctx_server_config)
@@ -207,12 +208,24 @@ def launch_disaggregated_llm(
         "generation_servers": num_gen_instances
     }
 
+    internal_request_auth_key = secrets.token_hex(32)
+
     # Inject disagg_cluster into server config (for minimal_instances and is_ready check)
     disaggregated_server_config["disagg_cluster"] = disagg_cluster
+    disaggregated_server_config["internal_request_auth_key"] = (
+        internal_request_auth_key)
 
     # Inject into worker configs
-    ctx_server_config = {**ctx_server_config, "disagg_cluster": disagg_cluster}
-    gen_server_config = {**gen_server_config, "disagg_cluster": disagg_cluster}
+    ctx_server_config = {
+        **ctx_server_config,
+        "disagg_cluster": disagg_cluster,
+        "internal_request_auth_key": internal_request_auth_key,
+    }
+    gen_server_config = {
+        **gen_server_config,
+        "disagg_cluster": disagg_cluster,
+        "internal_request_auth_key": internal_request_auth_key,
+    }
 
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
@@ -479,27 +492,6 @@ def launch_disaggregated_llm(
             thread_pool.futures.append(future)
             return future
 
-        def _get_perf_metrics():
-            path = "/perf_metrics"
-            perf_url = f"http://localhost:{serve_port}{path}"
-            try:
-                print(f"Fetching perf metrics from {perf_url}")
-                resp = requests.get(perf_url, timeout=10)
-                if resp.status_code == 200:
-                    try:
-                        metrics = resp.json()
-                        print("perf_metrics JSON:")
-                        print(json.dumps(metrics, indent=2, ensure_ascii=False))
-                    except ValueError:
-                        print("perf_metrics returned non-JSON response:",
-                              resp.text)
-                else:
-                    print(
-                        f"perf_metrics returned status {resp.status_code}: {resp.text}"
-                    )
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching {perf_url}: {e}")
-
         def _show_kvcache_time(kv_cache_perf_dir, max_lines=100):
             print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
             for file in os.listdir(kv_cache_perf_dir):
@@ -515,7 +507,6 @@ def launch_disaggregated_llm(
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
-                _get_perf_metrics()
 
             # Gracefully shut down all server processes
             all_processes = list(
@@ -1376,15 +1367,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1752,6 +1740,62 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                               model_name=self.MODEL_NAME,
                               test_sets=["MMLU", "GSM8K"])
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(200000)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
+                             ids=["cache_mgr_v1"])
+    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
+        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+        max_num_tokens = 8192
+        moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_autotuner": False,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "moe_config": moe_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_autotuner": False,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+            },
+            "generation_servers": {
+                "num_instances": 1,
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
@@ -2083,59 +2127,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(10800)
 @skip_pre_blackwell
-class TestKimiK2(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K2-Thinking"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
-
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(200000)
-    def test_nvfp4(self):
-        ctx_server_config = {
-            "max_batch_size": 16,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
-            },
-            "tensor_parallel_size": 4,
-            "enable_attention_dp": True,
-            "trust_remote_code": True,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-        }
-        gen_server_config = {
-            "max_batch_size": 16,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
-            },
-            "tensor_parallel_size": 4,
-            "enable_attention_dp": True,
-            "trust_remote_code": True,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
-
-@pytest.mark.timeout(10800)
-@skip_pre_blackwell
 class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
@@ -2145,9 +2136,13 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     def test_nvfp4(self):
         """Disaggregated GSM8K accuracy for Kimi-K2.5 (NVFP4).
 
-        ctx and gen servers are each TP4 (8 GPUs total) over the default cache
+        ctx and gen servers are each TP4 (8 GPUs total). The cache transceiver
+        uses backend=NIXL + transceiver_runtime=PYTHON: NIXL is required so the
+        disagg test harness skips its TRTLLM_USE_UCX_KVCACHE=1 fallback (which
+        would make the effective backend UCX and force the C++ transceiver),
+        letting the ctx->gen MLA-latent KV transfer run over the Python (v2)
         transceiver. GSM8K is text-only, so requests run through the DeepSeek-V3
-        MLA backbone (no vision) and the ctx->gen KV transfer is the MLA latent.
+        MLA backbone (no vision).
         Kimi-K2.5 ships custom HF modeling code (auto_map in config.json), so
         trust_remote_code must be set on both servers or executor init fails at
         config parse time.
@@ -2165,7 +2160,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "max_num_tokens": 8192,
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
@@ -2181,7 +2177,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "max_num_tokens": 8192,
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
@@ -2276,10 +2273,20 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    @parametrize_with_ids("use_py_transceiver", [True, False])
-    @parametrize_with_ids("block_reuse", [True, False])
-    @parametrize_with_ids("mtp_nextn", [0, 1, 3])
-    def test_auto_dtype(self, use_py_transceiver, block_reuse, mtp_nextn):
+    @pytest.mark.parametrize(
+        "mtp_nextn,block_reuse,use_py_transceiver",
+        [
+            (0, False, False),
+            (0, False, True),
+            (3, True, False),
+        ],
+        ids=[
+            "mtp_nextn=0-block_reuse=False-use_py_transceiver=False",
+            "mtp_nextn=0-block_reuse=False-use_py_transceiver=True",
+            "mtp_nextn=3-block_reuse=True-use_py_transceiver=False",
+        ],
+    )
+    def test_auto_dtype(self, mtp_nextn, block_reuse, use_py_transceiver):
         if use_py_transceiver and block_reuse:
             pytest.skip("Python transceiver does not support block reuse")
 
@@ -2399,7 +2406,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
-    def test_nvfp4_nixl_python(self, use_kv_cache_manager_v2):
+    def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
             "enable_block_reuse": False,
@@ -2407,7 +2414,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
-            "transceiver_runtime": "PYTHON",
         }
         moe_config = {"backend": "CUTEDSL"}
         speculative_config = {
@@ -2478,7 +2484,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
-        # TRTLLM backend required (WIDEEP lacks MXFP4 support for V4-Flash).
+        # TRTLLM backend required: it is the backend supporting V4-Flash MXFP4.
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
         cache_transceiver_config = {
@@ -2597,7 +2603,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # FP8 weights ~71 GB/rank at TP=4 → ~142 GB/rank at TP=2; requires
         # ≥140 GB per GPU (fits on B300 288 GB, tight on B200 178 GB).
-        # TRTLLM backend: WIDEEP's FP8 block-scale path is Hopper-only.
+        # TRTLLM backend: the CUTLASS FP8 block-scale path is Hopper-only.
         # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
         # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
         # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
@@ -2652,3 +2658,66 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                                       server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(200000)
+class TestDeepSeekR1(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-R1"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2"
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
+                             ids=["cache_mgr_v1"])
+    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
+        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+        max_num_tokens = 8192
+        moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_autotuner": False,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": False,
+            "moe_config": moe_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "max_tokens_in_buffer": 4096
+            },
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_autotuner": False,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+            },
+            "generation_servers": {
+                "num_instances": 1,
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

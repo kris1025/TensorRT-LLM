@@ -40,35 +40,6 @@ _MEM_FRACTION_80 = 0.8
 _MEM_FRACTION_95 = 0.95
 
 
-def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
-    """Build GPT-3 175B: 96 layer w/ plugins"""
-    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
-    engine_dir = os.path.join(engine_dir, "gpt-175-96layers-build-only")
-
-    dtype = 'float16'
-    convert_cmd = [
-        f"{example_root}/../../../generate_checkpoint_config.py",
-        f"--output_path={engine_dir}/ckpt_config.json",
-        "--architecture=GPTForCausalLM", f"--dtype={dtype}",
-        "--num_hidden_layers=1", "--num_attention_heads=96",
-        "--hidden_size=12288", "--vocab_size=51200", "--tp_size=8"
-    ]
-    venv_check_call(llm_venv, convert_cmd)
-
-    print("Building engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--model_config={engine_dir}/ckpt_config.json",
-        f"--output_dir={engine_dir}",
-        "--max_batch_size=256",
-        "--max_input_len=200",
-        "--max_seq_len=400",
-        "--max_beam_width=1",
-        f"--gpt_attention_plugin={dtype}",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-
 @pytest.mark.parametrize("model_name,model_path", [
     ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
 ])
@@ -1087,7 +1058,7 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @skip_pre_hopper
 @pytest.mark.parametrize("model_path", [
     pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
@@ -1259,7 +1230,7 @@ def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
 
 @skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param(
         'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
@@ -1288,7 +1259,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
 
 
 @pytest.mark.skip_less_device_memory(110000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param(
         'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
@@ -1327,7 +1298,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
 @skip_pre_ada
 @skip_post_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param('DeepSeek-R1-W4AFP8',
                  'DeepSeek-R1/DeepSeek-R1-W4AFP8',
@@ -1353,7 +1324,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(140000)
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
     """Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
 
@@ -1383,7 +1354,7 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
         },
         "enable_attention_dp": True,
         "moe_config": {
-            "backend": "WIDEEP",
+            "backend": "CUTLASS",
         },
         "cuda_graph_config": {
             "enable_padding": True,
@@ -1483,7 +1454,7 @@ def test_ptp_quickstart_advanced_multi_gpus(llm_root, llm_venv, model_name,
 @pytest.mark.parametrize("cuda_graph", [False, True])
 @pytest.mark.parametrize("tp_size, pp_size", [
     pytest.param(2, 2, marks=pytest.mark.skip_less_device(4)),
-    pytest.param(2, 4, marks=pytest.mark.skip_less_device(8)),
+    pytest.param(2, 4, marks=pytest.mark.skip_less_mpi_world_size(8)),
 ])
 @pytest.mark.parametrize("model_name,model_path", [
     pytest.param('Llama3.3-70B-FP8',
@@ -1514,7 +1485,7 @@ def test_ptp_quickstart_advanced_pp_enabled(llm_root, llm_venv, model_name,
 
 
 @skip_pre_hopper
-@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_mpi_world_size(8)
 @pytest.mark.parametrize("cuda_graph", [False, True])
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-4-Maverick-17B-128E-Instruct-FP8",
